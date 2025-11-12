@@ -1,0 +1,203 @@
+# -*- coding: utf-8 -*-
+# external_gen.py — text+image генерация и/или image+refs -> image, с текстом в ответе
+# Требует: pip install google-genai pillow
+import os, sys, argparse, glob, re
+from io import BytesIO
+from typing import List, Optional, Tuple
+
+from google import genai
+from google.genai import types
+from PIL import Image
+
+# Разрешённые соотношения сторон для gemini-2.5-flash-image (октябрь 2025):
+# Landscape: 21:9, 16:9, 4:3, 3:2
+# Square:    1:1
+# Portrait:  9:16, 3:4, 2:3
+# Flexible:  5:4, 4:5
+_ALLOWED_AR = {"1:1","3:2","2:3","3:4","4:3","4:5","5:4","9:16","16:9","21:9"}
+
+def get_script_dir() -> str:
+    try:
+        return os.path.dirname(os.path.abspath(__file__))
+    except Exception:
+        return os.getcwd()
+
+def ensure_images_dir(base_dir: str, override: Optional[str] = None) -> str:
+    d = override if override else os.path.join(base_dir, "nanoc4d_images")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+def next_numbered_basename(images_dir: str, stem: str) -> Tuple[str, int]:
+    """Ищем следующий индекс: output_001.jpg / .png и т.п."""
+    pat = re.compile(rf"^{re.escape(stem)}_(\d+)\.(?:jpg|jpeg|png)$", re.I)
+    mx = 0
+    for name in os.listdir(images_dir):
+        m = pat.match(name)
+        if m:
+            mx = max(mx, int(m.group(1)))
+    return f"{stem}_{mx+1:03d}", mx + 1
+
+def guess_ext(mime: Optional[str], default_ext: str = "jpg") -> str:
+    if not mime:
+        return default_ext
+    mime = mime.lower()
+    if "png" in mime: return "png"
+    if "jpeg" in mime or "jpg" in mime: return "jpg"
+    return default_ext
+
+def load_image_bytes(path: str) -> Tuple[bytes, str]:
+    ext = os.path.splitext(path)[1].lower()
+    mime = "image/png" if ext == ".png" else "image/jpeg"
+    with open(path, "rb") as f:
+        return f.read(), mime
+
+def build_contents(prompt: str, main: Optional[str], refs: List[str]) -> list:
+    parts = [prompt]
+    # Основное изображение (если есть)
+    if main and os.path.isfile(main):
+        data, mime = load_image_bytes(main)
+        parts.append(types.Part.from_bytes(data=data, mime_type=mime))
+    # До двух референсов (если есть)
+    for rp in refs[:2]:
+        if os.path.isfile(rp):
+            data, mime = load_image_bytes(rp)
+            parts.append(types.Part.from_bytes(data=data, mime_type=mime))
+    return parts
+
+def iter_parts(response) -> list:
+    """Нормализуем parts: поддерживаем и response.parts, и candidates[0].content.parts."""
+    if hasattr(response, "parts") and response.parts:
+        return list(response.parts)
+    if hasattr(response, "candidates") and response.candidates:
+        out = []
+        for cand in response.candidates:
+            content = getattr(cand, "content", None)
+            if content and getattr(content, "parts", None):
+                out.extend(content.parts)
+        return out
+    return []
+
+def save_outputs(images_dir: str, stem: str, parts: list, prefer_ext: str = "jpg") -> Tuple[Optional[str], Optional[str]]:
+    """Сохраняем первую картинку и текст (если есть). Возвращаем пути (img_path, txt_path)."""
+    img_path, txt_path = None, None
+    text_chunks = []
+    image_bytes, image_mime = None, None
+
+    for p in parts:
+        # Текстовая часть
+        if getattr(p, "text", None):
+            if p.text.strip():
+                text_chunks.append(p.text.strip())
+        # Картинка в виде inline_data
+        inline = getattr(p, "inline_data", None)
+        if inline and getattr(inline, "data", None) and image_bytes is None:
+            image_bytes = inline.data
+            image_mime = getattr(inline, "mime_type", None)
+
+        # На случай, если SDK даёт удобный helper (не во всех версиях):
+        if hasattr(p, "as_image") and image_bytes is None:
+            try:
+                pil_img = p.as_image()  # PIL.Image
+                bio = BytesIO()
+                pil_img.save(bio, format="PNG")
+                image_bytes = bio.getvalue()
+                image_mime = "image/png"
+            except Exception:
+                pass
+
+    # Сохраняем картинку (если пришла)
+    if image_bytes:
+        base, _ = next_numbered_basename(images_dir, stem)
+        ext = guess_ext(image_mime, default_ext=prefer_ext)
+        img_path = os.path.join(images_dir, f"{base}.{ext}")
+        with open(img_path, "wb") as f:
+            f.write(image_bytes)
+        print(f"Saved output: {img_path}")
+
+    # Сохраняем текст (если пришёл)
+    if text_chunks:
+        base, _ = next_numbered_basename(images_dir, stem) if not image_bytes else (os.path.splitext(os.path.basename(img_path))[0], 0)
+        txt_path = os.path.join(images_dir, f"{base}.txt")
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write("\n\n".join(text_chunks))
+        print("TEXT:", (text_chunks[0][:4000] + ("…" if len(text_chunks[0]) > 4000 else "")))
+
+    return img_path, txt_path
+
+def _normalize_aspect(value: str) -> str:
+    """
+    Возвращает нормализованный aspect ratio или пустую строку:
+    - 'auto' / '' / None -> ''
+    - допускаем пробелы и ведущие нули (например '03:02' -> '3:2')
+    - значение должно быть в _ALLOWED_AR
+    """
+    if not value:
+        return ""
+    v = value.strip().lower()
+    if v == "auto":
+        return ""
+    # нормализуем цифры
+    m = re.match(r"^\s*0*(\d+)\s*:\s*0*(\d+)\s*$", v)
+    if not m:
+        raise SystemExit(f"ERROR: invalid aspect value '{value}'. Expected something like '16:9' or '4:5'.")
+    a, b = m.group(1), m.group(2)
+    norm = f"{int(a)}:{int(b)}"
+    if norm not in _ALLOWED_AR:
+        raise SystemExit(f"ERROR: aspect '{norm}' is not supported by gemini-2.5-flash-image.\n"
+                         f"Supported: {', '.join(sorted(_ALLOWED_AR))}")
+    return norm
+
+def main():
+    ap = argparse.ArgumentParser("external_gen.py")
+    ap.add_argument("--images-dir", type=str, default="", help="Куда сохранять output_*")
+    ap.add_argument("--prompt", type=str, required=True)
+    ap.add_argument("--main", type=str, default="", help="Опционально: путь к main image")
+    ap.add_argument("--refs", nargs="*", default=[], help="Опционально до двух референсов")
+    ap.add_argument("--model", type=str, default="gemini-2.5-flash-image")
+    ap.add_argument("--aspect", type=str, default="", help='Опционально: "auto" или одно из: 1:1,3:2,2:3,3:4,4:3,4:5,5:4,9:16,16:9,21:9')
+    ap.add_argument("--format", type=str, default="jpg", choices=["jpg","png"], help="Расширение для сохранения по умолчанию")
+    args = ap.parse_args()
+
+    script_dir = get_script_dir()
+    images_dir = ensure_images_dir(script_dir, args.images_dir or None)
+
+    # Подрежем refs до реально существующих файлов
+    refs: List[str] = [p for p in args.refs[:2] if os.path.isfile(p)]
+    for rp in args.refs[:2]:
+        if not os.path.isfile(rp):
+            print("WARN: ref not found, skipped:", rp)
+
+    # Собираем контент: prompt [+ optional images]
+    contents = build_contents(args.prompt, args.main if os.path.isfile(args.main) else "", refs)
+
+    # Клиент (ключ берём из окружения: GOOGLE_API_KEY или GEMINI_API_KEY)
+    api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+    client = genai.Client(api_key=api_key) if api_key else genai.Client()
+
+    # Конфиг для мультимодального ответа + (опционально) aspect ratio
+    config_kwargs = {"response_modalities": ["TEXT", "IMAGE"]}  # мультимодальные ответы поддерживаются моделью
+    norm_ar = _normalize_aspect(args.aspect)
+    if norm_ar:
+        config_kwargs["image_config"] = types.ImageConfig(aspect_ratio=norm_ar)
+
+    response = client.models.generate_content(
+        model=args.model,
+        contents=contents,
+        config=types.GenerateContentConfig(**config_kwargs),
+    )
+
+    parts = iter_parts(response)
+    if not parts:
+        print("ERROR: Empty response parts"); sys.exit(3)
+
+    img_path, txt_path = save_outputs(images_dir, stem="output", parts=parts, prefer_ext=args.format)
+
+    # Если модель вдруг не вернула изображение — считаем это ошибкой (нам нужна пара: текст+картинка)
+    if not img_path:
+        print("ERROR: model returned no images; adjust your prompt or try again.")
+        sys.exit(4)
+
+    sys.exit(0)
+
+if __name__ == "__main__":
+    main()
